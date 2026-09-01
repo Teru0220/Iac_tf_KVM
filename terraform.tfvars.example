@@ -1,0 +1,2 @@
+# terraform.tfvars.example として保存
+image_path = "/path/to/your/image.qcow2"

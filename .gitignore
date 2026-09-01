@@ -1,0 +1,13 @@
+# 状態ファイル（IPアドレスや環境の絶対パスが含まれるため除外）
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# ローカル設定ファイル（実パスや秘密情報が含まれるため除外）
+terraform.tfvars
+*.auto.tfvars
+
+# Terraform 内部キャッシュ・プラグイン
+.terraform/
+.terraform.lock.hcl
