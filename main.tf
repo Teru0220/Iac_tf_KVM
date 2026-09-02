@@ -10,10 +10,9 @@ resource "libvirt_domain" "worker_node" {
   os = {
     type         = "hvm"
     type_arch    = "x86_64"
-    type_machine = "q35"
+    type_machine = "pc"
     boot_devices = [
-      { dev = "hd" },
-      { dev = "network" }
+      { dev = "hd" }
     ]
   }
 
@@ -21,10 +20,12 @@ resource "libvirt_domain" "worker_node" {
     disks = [
       {
         source = {
-          volume = {
-            pool   = libvirt_volume.worker_disk[count.index].pool
-            volume = libvirt_volume.worker_disk[count.index].name
+          file = {
+            file = "/var/lib/libvirt/images/worker-${format("%02d", count.index + 1)}.qcow2"
           }
+        }
+        driver = {
+          type = "qcow2"
         }
         target = {
           dev = "vda"
@@ -44,6 +45,24 @@ resource "libvirt_domain" "worker_node" {
         }
       }
     ]
+    consoles = [
+      {
+        target = {
+          type = "serial"
+          port = "0"
+        }
+      }
+    ]
+    graphics = [
+      {
+        spice = {
+          autoport = true
+        }
+        listen = {
+          type = "address"
+        }
+      }
+    ]
   }
 }
 
@@ -53,15 +72,17 @@ resource "libvirt_volume" "worker_disk" {
   name     = format("worker-%02d.qcow2", count.index + 1)
   pool     = "default"
   capacity = 42949672960 # 40GB (バイト指定)
-  target = {
-        format = {
-        type = "qcow2"
-        }
-    }
 
-    create = {
-    content = {
-      url = var.image_path
+  target = {
+    format = {
+      type = "qcow2"
+    }
+  }
+
+  backing_store = {
+    path   = var.image_path
+    format = {
+      type = "qcow2"
     }
   }
 }
