@@ -44,6 +44,30 @@
 * **症状**: シリアルコンソール (`virsh console`) や `virt-viewer` で画面が暗転またはプロンプトが出力されない。
 * **原因**: CUI OS であってもテキストを描画・出力するための仮想 GPU (`videos`) および通信プロトコル (`graphics`) が未定義だったため。
 
+### 1-5. Q35 マシンタイプでの起動停止問題 (`dracut` / LVM 待機タイムアウト) 【解決済】
+
+* **症状**: GRUB ブートローダー通過後、`dracut` (initramfs) 内の LVM 活性化処理で停止し、`Job dev-disk-by-uuid...` のタイムアウトが発生して Ubuntu 24.04 が起動しない。
+* **原因の特定過程**:
+正常動作している `Control Plane` と起動しない `worker-node-01` の XML 定義を比較分析した結果、Q35 アーキテクチャにおける PCIe ルートポート配下の VirtIO ディスク (`vda`) に対する割り込みシグナルおよびデバイス構成情報を OS (Linux カーネル) へ渡す機能 (`features`: ACPI / APIC) が `worker-node-01` 側のドメイン定義から抜け落ちていることを特定。
+* **解決策**:
+`libvirt_domain` リソースへ以下の `features` ブロックを追加することで正常起動を確認。
+```hcl
+features = {
+  acpi = true
+  apic = {}
+  vm_port = { 
+    state = "off"
+  }
+}
+
+```
+
+
+* **ACPI (`acpi = true`)**: PCIe バスおよび接続デバイスの自動検出 (DSDT テーブル提供) に必須。
+* **APIC (`apic = {}`)**: PCIe デバイスと CPU 間の割り込み処理 (IRQ) の正常化に必須。
+
+
+
 ---
 
 ## 2. 解決後の構造設計 (IaC / HCL)
@@ -68,6 +92,29 @@ resource "libvirt_domain" "worker_node" {
     ]
   }
 
+  cpu = {
+    mode = "host-passthrough"
+  }
+
+  # 起動停止問題を解決するための必須機能フラグ
+  features = {
+    acpi = true
+    apic = {}
+    vm_port = { 
+      state = "off"
+    }
+  }
+
+  # Control Plane 同等のタイマー設定
+  clock = {
+    offset = "utc"
+    timer = [
+      { name = "rtc",  tick_policy = "catchup" },
+      { name = "pit",  tick_policy = "delay" },
+      { name = "hpet", present = "no" }
+    ]
+  }
+
   devices = {
     # ディスク設定 (qcow2 明示指定)
     disks = [
@@ -79,7 +126,8 @@ resource "libvirt_domain" "worker_node" {
           }
         }
         driver = {
-          type = "qcow2"
+          type    = "qcow2"
+          discard = "unmap"
         }
         target = {
           dev = "vda"
@@ -112,13 +160,12 @@ resource "libvirt_domain" "worker_node" {
       }
     ]
 
-    # グラフィック転送設定 (VNC)
+    # グラフィック転送設定 (SPICE)
     graphics = [
       {
-        type = "vnc"
-        listen = {
-          type    = "address"
-          address = "0.0.0.0"
+        spice = {
+          auto_port = true
+          listeners = [{ address = {} }]
         }
       }
     ]
@@ -129,6 +176,16 @@ resource "libvirt_domain" "worker_node" {
         model = {
           type = "virtio"
         }
+      }
+    ]
+
+    # VirtIO-RNG (乱数生成による起動遅延防止)
+    rngs = [
+      {
+        backend = {
+          random = "/dev/urandom"
+        }
+        model = "virtio"
       }
     ]
   }
@@ -144,14 +201,15 @@ resource "libvirt_domain" "worker_node" {
 
 * **シリアルコンソールセッションの競合解除**:
 前回の接続がバックグラウンドに残った場合は `--force` オプションで上書き接続する。
+
 ```bash
 virsh console worker-node-01 --force
 
 ```
 
-
 * **ゲスト OS 側の GRUB シリアル出力有効化**:
 `virsh console` 経由でログイン画面を常時出力させたい場合は、ゲスト OS 側で以下を適用する。
+
 ```bash
 sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8 /' /etc/default/grub
 sudo update-grub
@@ -159,7 +217,16 @@ sudo systemctl enable --now serial-getty@ttyS0.service
 
 ```
 
+---
 
+## 4. 今後のタスク (最小構成の割り出し計画)
+
+動作確認のために追加した設定要素のうち、真に必要な最小構成を検証してコードの簡素化を図る。
+
+* [ ] **`vm_port` の検証**: `state = "off"` を削除し、デフォルト挙動で問題ないか確認。
+* [ ] **`clock` の検証**: HPET 無効化などの個別タイマー設定を削り、デフォルト状態（`<clock offset="utc"/>`）でブート可能かテスト。
+* [ ] **`metadata` の検証**: `libosinfo` の XML 埋め込みなしでの正常性を再確認。
+* [ ] **ACPI / APIC の最小化**: `features` ブロック内で真に必須な記述レベルを絞り込み。
 
 ```
 
