@@ -18,26 +18,9 @@ resource "libvirt_domain" "worker_node" {
     mode = "host-passthrough"
   }
 
-  metadata = {
-    xml ="<libosinfo:libosinfo xmlns:libosinfo='http://libosinfo.org/xmlns/libvirt/domain/1.0'><libosinfo:os id='http://ubuntu.com/ubuntu/24.04'/></libosinfo:libosinfo>"
-  }
-
   features = {
     acpi = true
     apic = {}
-    vm_port = { 
-      state = "off"
-    }
-  }
-
-  # Control Plane と同一のタイマー設定（HPET 無効化）
-  clock = {
-    offset = "utc"
-    timer = [
-      { name = "rtc",  tick_policy = "catchup" },
-      { name = "pit",  tick_policy = "delay" },
-      { name = "hpet", present = "no" }
-    ]
   }
 
   devices = {
@@ -74,31 +57,6 @@ resource "libvirt_domain" "worker_node" {
 
     graphics = [
       { spice = { auto_port = true, listeners = [{ address = {} }] } }
-    ]
-
-    videos = [
-      { model = { type = "virtio" } }
-    ]
-
-    channels = [
-      {
-        source = { unix = {} }
-        target = { virt_io = { name = "org.qemu.guest_agent.0" } }
-      },
-      {
-        source = { spice_vmc = true }
-        target = { virt_io = { name = "com.redhat.spice.0" } }
-      }
-    ]
-
-    # エントロピー（乱数）不足による起動遅延を防ぐ VirtIO-RNG
-    rngs = [
-      {
-        backend = {
-          random = "/dev/urandom"
-        }
-        model = "virtio"
-      }
     ]
   }
 }
