@@ -14,7 +14,7 @@
   * **Control Plane**: 4GB RAM, 40GB Disk, 2 vCPU
   * **Worker Nodes**: 8GB RAM, 40GB Disk, 2 vCPU (×2 台)
 * **実環境の動作検証**
-  * 最小構成の `libvirt_domain` / `libvirt_volume` を使用し、SSH 接続およびネットワーク疎通（`192.168.122.131/24`）を確認。
+  * 最小構成の `libvirt_domain` / `libvirt_volume` を使用し、SSH 接続およびネットワーク疎通を確認。
 
 ---
 
