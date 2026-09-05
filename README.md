@@ -34,7 +34,7 @@
 * **症状**: 破壊された VM 状態のまま `terraform apply` / `destroy` を実行した際、`Instance libvirt_domain... has status ObjectStatus(0)` で panic クラッシュが発生。
 * **原因**: 不正な状態で残ったリソースを Terraform Core が state ファイルへ書き込めずパニックを起こした。
 * **解決策**:
-1. `terraform state rm "libvirt_domain.worker_node[0]"` で壊れたリソースをステートから手動切離し。
+1. `terraform state rm "libvirt_domain.node[0]"` で壊れたリソースをステートから手動切離し。
 2. `virsh destroy` / `virsh undefine` で KVM 上の孤立ドメインを消去後、再実行。
 
 
@@ -48,7 +48,7 @@
 
 * **症状**: GRUB ブートローダー通過後、`dracut` (initramfs) 内の LVM 活性化処理で停止し、`Job dev-disk-by-uuid...` のタイムアウトが発生して Ubuntu 24.04 が起動しない。
 * **原因の特定過程**:
-正常動作している `Control Plane` と起動しない `worker-node-01` の XML 定義を比較分析した結果、Q35 アーキテクチャにおける PCIe ルートポート配下の VirtIO ディスク (`vda`) に対する割り込みシグナルおよびデバイス構成情報を OS (Linux カーネル) へ渡す機能 (`features`: ACPI / APIC) が `worker-node-01` 側のドメイン定義から抜け落ちていることを特定。
+正常動作している `Control Plane` と起動しない `node-01` の XML 定義を比較分析した結果、Q35 アーキテクチャにおける PCIe ルートポート配下の VirtIO ディスク (`vda`) に対する割り込みシグナルおよびデバイス構成情報を OS (Linux カーネル) へ渡す機能 (`features`: ACPI / APIC) が `node-01` 側のドメイン定義から抜け落ちていることを特定。
 * **解決策**:
 `libvirt_domain` リソースへ以下の `features` ブロックを追加することで正常起動を確認。
 ```hcl
@@ -75,9 +75,8 @@ features = {
 `dmacvicar/libvirt` (v0.9.x) において、`q35` チップセットを維持しつつ CUI ノードへ確実にアクセスするための推奨構成です。
 
 ```hcl
-resource "libvirt_domain" "worker_node" {
-  count       = var.worker_count
-  name        = format("worker-node-%02d", count.index + 1)
+resource "libvirt_domain" "node" {
+  name        = var.node.domain_name
   memory      = 8192
   memory_unit = "MiB"
   vcpu        = 2
@@ -121,8 +120,8 @@ resource "libvirt_domain" "worker_node" {
       {
         source = {
           volume = {
-            pool   = libvirt_volume.worker_disk[count.index].pool
-            volume = libvirt_volume.worker_disk[count.index].name
+            pool   = var.node.volume_pool
+            volume = var.volume_name
           }
         }
         driver = {
@@ -190,7 +189,7 @@ resource "libvirt_domain" "worker_node" {
     ]
   }
 
-  depends_on = [libvirt_volume.worker_disk]
+  depends_on = [libvirt_volume.node_disk]
 }
 
 ```
@@ -203,7 +202,7 @@ resource "libvirt_domain" "worker_node" {
 前回の接続がバックグラウンドに残った場合は `--force` オプションで上書き接続する。
 
 ```bash
-virsh console worker-node-01 --force
+virsh console node-01 --force
 
 ```
 

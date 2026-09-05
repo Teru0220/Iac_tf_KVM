@@ -1,2 +1,30 @@
-# terraform.tfvars.example として保存
-image_path = "/path/to/your/image.qcow2"
+nodes = [
+  {
+    domain_name        = "node-01"
+    volume_name        = "node-01.qcow2"
+    image_path         = "/path/to/your/image.qcow2"
+    volume_pool        = "default"
+    volume_capacity    = 42949672960
+    volume_format      = "qcow2"
+    volume_target      = { format = { type = "qcow2" } }
+    domain_memory      = 8192
+    domain_memory_unit = "MiB"
+    domain_vcpu        = 2
+    domain_type        = "kvm"
+    disk_driver        = { type = "qcow2", discard = "unmap" }
+    disk_target        = { dev = "vda", bus = "virtio" }
+    os = {
+      type         = "hvm"
+      type_arch    = "x86_64"
+      type_machine = "q35"
+      boot_devices = [{ dev = "hd" }]
+    }
+    cpu      = { mode = "host-passthrough" }
+    features = { acpi = true, apic = {} }
+    devices = {
+      interfaces = [{ model = { type = "virtio" }, source = { network = { network = "default" } } }]
+      consoles   = [{ target = { type = "serial", port = "0" } }]
+      graphics   = [{ spice = { auto_port = true, listeners = [{ address = {} }] } }]
+    }
+  }
+]
