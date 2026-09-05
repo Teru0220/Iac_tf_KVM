@@ -1,232 +1,197 @@
-```markdown
-# Libvirt / QEMU 環境における KVM 仮想ノードプロビジョニングのトラブルシューティングと構成ガイド
+# KVM ノードプロビジョニング
 
-本ドキュメントは、Terraform (`dmacvicar/libvirt` プロバイダー v0.9.x) を使用して KVM 上に Kubernetes ワーカーノードを自動デプロイする際発生した課題、原因究明、および最終的な解決構成についてまとめたものです。
+Terraform と `dmacvicar/libvirt` provider を使用して、ローカルの KVM/libvirt 環境へ複数の仮想ノードと qcow2 ボリュームを作成する構成です。
 
----
+## 構成
 
-## 1. 発生した課題と経緯
+```text
+composition/
+  main.tf              # nodes を for_each で展開するルート構成
+  variables.tf         # nodes の型定義
+  terraform.tfvars     # 作成するノードの具体的な設定
+  provider.tf          # libvirt provider
+  tests/               # terraform test 用のテスト
 
-### 1-1. ディスクフォーマット認識エラー (`raw` へのフォールバック)
-* **症状**: `qcow2` 形式のイメージを指定しているにもかかわらず、`raw` フォーマットとして認識されブートに失敗。
-* **原因**: `dmacvicar/libvirt` (v0.9.x) プロバイダー仕様上、`disk` ブロック内で明示的なフォーマットおよびドライバーの宣言を行わない場合、デフォルトの `raw` にフォールバックするため。
-* **解決策**:
-  ```hcl
-  driver = { type = "qcow2" }
-  target = { dev = "vda", bus = "virtio" }
+infrastructure_module/
+  main.tf              # 1ノード分の volume/domain module を接続
+  variables.tf
+  outputs.tf
 
+resource_module/
+  libvirt_volume/      # 1ボリュームを作成
+  libvirt_domain/      # 1ドメインを作成
 ```
 
-上記を明示的に指定することで正常認識を確保。
+処理の流れは次のとおりです。
 
-### 1-2. `type_machine = "q35"` 使用時のカーネルフリーズ (`pciehp` ループ)
+```text
+composition
+  -> infrastructure_module (node 単位)
+    -> libvirt_volume
+    -> libvirt_domain
+```
 
-* **症状**: OS 起動中に `pciehp: Slot(0): Card not present` などのメッセージで停止し、ログイン画面まで到達しない。
-* **原因**:
-* GUI ツール (`virt-manager`) は `q35` マシンタイプ選択時に PCIe コントローラーやビデオカード、グラフィック設定を自動補完する。
-* IaC (Terraform) では最低限のデバイスしか追加されないため、QEMU が自動生成する PCIe Root Port と OS (Ubuntu) 側の PCIe ホットプラグドライバ間で割り込み衝突・ループが発生。
+`for_each` は `composition` だけで使用します。下位 module は常に1つの `node` を処理し、volume の output を domain module に渡します。
 
+## 前提条件
 
-* **解決策**: 一時的に `type_machine = "pc"` (i440fx) へ変更してブートを確認後、本質的解決として `graphics` および `videos` デバイスを明示構成に組み込む方針へ移行。
+- Linux
+- Terraform 1.6 以上
+- KVM/libvirt
+- `qemu:///system` に接続できる libvirt 環境
+- `dmacvicar/libvirt` provider 0.9.9
+- OS をインストール済みの既存 qcow2 イメージ
 
-### 1-3. Terraform State クラッシュ (`ObjectStatus(0)`)
+この構成は、OS 未インストールの空ディスクからノードを作成するものではありません。あらかじめ OS、ブートローダー、必要な初期設定を済ませた qcow2 イメージを用意し、それを各ノードの元イメージとしてクローンする必要があります。
 
-* **症状**: 破壊された VM 状態のまま `terraform apply` / `destroy` を実行した際、`Instance libvirt_domain... has status ObjectStatus(0)` で panic クラッシュが発生。
-* **原因**: 不正な状態で残ったリソースを Terraform Core が state ファイルへ書き込めずパニックを起こした。
-* **解決策**:
-1. `terraform state rm "libvirt_domain.node[0]"` で壊れたリソースをステートから手動切離し。
-2. `virsh destroy` / `virsh undefine` で KVM 上の孤立ドメインを消去後、再実行。
+`image_path` には、その既存 qcow2 イメージの絶対パスを指定してください。`libvirt_volume` は `backing_store` を使用してこのイメージを backing image とする qcow2 volume を作成し、各ノードのドメインへ接続します。
 
+```text
+OS インストール済み qcow2
+  |
+  +-- node-01.qcow2 -> node-01
+  +-- node-02.qcow2 -> node-02
+```
 
+イメージが存在しない場合、パスや形式が実際のファイルと異なる場合、または OS がインストールされていない場合は、ノードの作成や起動に失敗します。Terraform を実行するユーザーから読み取り可能な場所にイメージを配置してください。
 
-### 1-4. CUI ノードにおける画面出力・コンソールアクセス不能
+provider は [composition/provider.tf](composition/provider.tf) で次の URI を使用します。
 
-* **症状**: シリアルコンソール (`virsh console`) や `virt-viewer` で画面が暗転またはプロンプトが出力されない。
-* **原因**: CUI OS であってもテキストを描画・出力するための仮想 GPU (`videos`) および通信プロトコル (`graphics`) が未定義だったため。
-
-### 1-5. Q35 マシンタイプでの起動停止問題 (`dracut` / LVM 待機タイムアウト) 【解決済】
-
-* **症状**: GRUB ブートローダー通過後、`dracut` (initramfs) 内の LVM 活性化処理で停止し、`Job dev-disk-by-uuid...` のタイムアウトが発生して Ubuntu 24.04 が起動しない。
-* **原因の特定過程**:
-正常動作している `Control Plane` と起動しない `node-01` の XML 定義を比較分析した結果、Q35 アーキテクチャにおける PCIe ルートポート配下の VirtIO ディスク (`vda`) に対する割り込みシグナルおよびデバイス構成情報を OS (Linux カーネル) へ渡す機能 (`features`: ACPI / APIC) が `node-01` 側のドメイン定義から抜け落ちていることを特定。
-* **解決策**:
-`libvirt_domain` リソースへ以下の `features` ブロックを追加することで正常起動を確認。
 ```hcl
-features = {
-  acpi = true
-  apic = {}
-  vm_port = { 
-    state = "off"
-  }
+provider "libvirt" {
+  uri = "qemu:///system"
 }
-
 ```
 
+Terraform 実行ユーザーが libvirt を操作できることを確認してください。
 
-* **ACPI (`acpi = true`)**: PCIe バスおよび接続デバイスの自動検出 (DSDT テーブル提供) に必須。
-* **APIC (`apic = {}`)**: PCIe デバイスと CPU 間の割り込み処理 (IRQ) の正常化に必須。
+## ノード設定
 
-
-
----
-
-## 2. 解決後の構造設計 (IaC / HCL)
-
-`dmacvicar/libvirt` (v0.9.x) において、`q35` チップセットを維持しつつ CUI ノードへ確実にアクセスするための推奨構成です。
+具体的な設定は [composition/terraform.tfvars](composition/terraform.tfvars) の `nodes` 配列に記述します。ノードごとに全パラメータを個別指定できます。
 
 ```hcl
-resource "libvirt_domain" "node" {
-  name        = var.node.domain_name
-  memory      = 8192
-  memory_unit = "MiB"
-  vcpu        = 2
-  type        = "kvm"
-
-  os = {
-    type         = "hvm"
-    type_arch    = "x86_64"
-    type_machine = "q35"
-    boot_devices = [
-      { dev = "hd" }
-    ]
-  }
-
-  cpu = {
-    mode = "host-passthrough"
-  }
-
-  # 起動停止問題を解決するための必須機能フラグ
-  features = {
-    acpi = true
-    apic = {}
-    vm_port = { 
-      state = "off"
+nodes = [
+  {
+    domain_name        = "node-01"
+    volume_name        = "node-01.qcow2"
+    image_path         = "/path/to/image.qcow2"
+    volume_pool        = "default"
+    volume_capacity    = 42949672960
+    volume_format      = "qcow2"
+    volume_target      = { format = { type = "qcow2" } }
+    domain_memory      = 8192
+    domain_memory_unit = "MiB"
+    domain_vcpu        = 2
+    domain_type        = "kvm"
+    disk_driver        = { type = "qcow2", discard = "unmap" }
+    disk_target        = { dev = "vda", bus = "virtio" }
+    os = {
+      type         = "hvm"
+      type_arch    = "x86_64"
+      type_machine = "q35"
+      boot_devices = [{ dev = "hd" }]
+    }
+    cpu      = { mode = "host-passthrough" }
+    features = { acpi = true, apic = {} }
+    devices = {
+      interfaces = [{
+        model  = { type = "virtio" }
+        source = { network = { network = "default" } }
+      }]
+      consoles = [{ target = { type = "serial", port = "0" } }]
+      graphics = [{ spice = { auto_port = true, listeners = [{ address = {} }] } }]
     }
   }
-
-  # Control Plane 同等のタイマー設定
-  clock = {
-    offset = "utc"
-    timer = [
-      { name = "rtc",  tick_policy = "catchup" },
-      { name = "pit",  tick_policy = "delay" },
-      { name = "hpet", present = "no" }
-    ]
-  }
-
-  devices = {
-    # ディスク設定 (qcow2 明示指定)
-    disks = [
-      {
-        source = {
-          volume = {
-            pool   = var.node.volume_pool
-            volume = var.volume_name
-          }
-        }
-        driver = {
-          type    = "qcow2"
-          discard = "unmap"
-        }
-        target = {
-          dev = "vda"
-          bus = "virtio"
-        }
-      }
-    ]
-
-    # ネットワーク設定
-    interfaces = [
-      {
-        model = {
-          type = "virtio"
-        }
-        source = {
-          network = {
-            network = "default"
-          }
-        }
-      }
-    ]
-
-    # シリアルコンソール (virsh console 用)
-    consoles = [
-      {
-        target = {
-          type = "serial"
-          port = "0"
-        }
-      }
-    ]
-
-    # グラフィック転送設定 (SPICE)
-    graphics = [
-      {
-        spice = {
-          auto_port = true
-          listeners = [{ address = {} }]
-        }
-      }
-    ]
-
-    # 仮想ビデオカード (CUIのテキスト画面描画用)
-    videos = [
-      {
-        model = {
-          type = "virtio"
-        }
-      }
-    ]
-
-    # VirtIO-RNG (乱数生成による起動遅延防止)
-    rngs = [
-      {
-        backend = {
-          random = "/dev/urandom"
-        }
-        model = "virtio"
-      }
-    ]
-  }
-
-  depends_on = [libvirt_volume.node_disk]
-}
-
+]
 ```
 
----
+### 主なパラメータ
 
-## 3. コンソール接続・運用ナレッジ
+| パラメータ | 説明 |
+| --- | --- |
+| `domain_name` | libvirt ドメイン名。`nodes` の `for_each` キーにも使用 |
+| `volume_name` | 作成する libvirt volume 名 |
+| `image_path` | backing image の絶対パス |
+| `volume_pool` | libvirt storage pool |
+| `volume_capacity` | volume 容量（byte） |
+| `volume_format` | volume と backing image の形式 |
+| `volume_target` | volume の target 設定 |
+| `domain_memory` | メモリ容量 |
+| `domain_memory_unit` | メモリ単位 |
+| `domain_vcpu` | vCPU 数 |
+| `domain_type` | libvirt の仮想化タイプ |
+| `disk_driver` | ドメインディスクの driver 設定 |
+| `disk_target` | ドメインディスクの target 設定 |
+| `os` | OS、アーキテクチャ、machine、boot 設定 |
+| `cpu` | CPU モード |
+| `features` | ACPI/APIC などの機能 |
+| `devices` | ネットワーク、コンソール、グラフィックなどのデバイス |
 
-* **シリアルコンソールセッションの競合解除**:
-前回の接続がバックグラウンドに残った場合は `--force` オプションで上書き接続する。
+`domain_name` は重複できません。重複すると `composition` の `for_each` キーが衝突します。
+
+## 実行方法
+
+作業ディレクトリを `composition` にして実行します。
+
+```bash
+cd composition
+terraform init
+terraform fmt -recursive
+terraform validate
+terraform plan
+terraform apply
+```
+
+適用後は作成された名前を確認できます。
+
+```bash
+terraform output domain_names
+terraform output volume_names
+```
+
+削除する場合は、同じ `composition` ディレクトリで実行します。
+
+```bash
+terraform destroy
+```
+
+## テスト
+
+native Terraform test を使用しています。テストは `plan` モードで実行されるため、libvirt リソースを実際には作成しません。
+
+```bash
+terraform -chdir=composition test
+```
+
+テストファイルは [composition/tests/nodes.tftest.hcl](composition/tests/nodes.tftest.hcl) です。複数の node から domain と volume が生成され、それぞれの名前が設定値どおりになることを検証します。
+
+## コンソール接続
+
+ゲスト OS 側でシリアルログインを有効にした後、次のコマンドで接続できます。
 
 ```bash
 virsh console node-01 --force
-
 ```
 
-* **ゲスト OS 側の GRUB シリアル出力有効化**:
-`virsh console` 経由でログイン画面を常時出力させたい場合は、ゲスト OS 側で以下を適用する。
+GRUB と serial getty の設定例:
 
 ```bash
 sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8 /' /etc/default/grub
 sudo update-grub
 sudo systemctl enable --now serial-getty@ttyS0.service
-
 ```
 
----
+## 注意事項
 
-## 4. 今後のタスク (最小構成の割り出し計画)
+- `image_path` は実行環境から参照できるパスを指定してください。
+- `domain_name` や `volume_name` を変更すると、Terraform は既存リソースを別リソースとして扱う場合があります。
+- 既存 state がある状態で resource/module 名を変更した場合は、`terraform plan` を確認してから apply してください。
+- KVM/libvirt 上の手動変更は Terraform state と不一致になるため、可能な限り Terraform 経由で管理してください。
 
-動作確認のために追加した設定要素のうち、真に必要な最小構成を検証してコードの簡素化を図る。
+## 参考ファイル
 
-* [ ] **`vm_port` の検証**: `state = "off"` を削除し、デフォルト挙動で問題ないか確認。
-* [ ] **`clock` の検証**: HPET 無効化などの個別タイマー設定を削り、デフォルト状態（`<clock offset="utc"/>`）でブート可能かテスト。
-* [ ] **`metadata` の検証**: `libosinfo` の XML 埋め込みなしでの正常性を再確認。
-* [ ] **ACPI / APIC の最小化**: `features` ブロック内で真に必須な記述レベルを絞り込み。
-
-```
-
-```
+- [terraform.tfvars.example](terraform.tfvars.example)
+- [composition/main.tf](composition/main.tf)
+- [infrastructure_module/main.tf](infrastructure_module/main.tf)
+- [resource_module/libvirt_volume/main.tf](resource_module/libvirt_volume/main.tf)
+- [resource_module/libvirt_domain/main.tf](resource_module/libvirt_domain/main.tf)
